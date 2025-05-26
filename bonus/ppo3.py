@@ -37,27 +37,34 @@ def get_rewards(preds, refs):
 def run_ppo(model_path, dataset_path, output_dir):
     dataset = load_from_disk(dataset_path)
     train_dataset = dataset["train"]
+    
     config = PPOConfig(
-    model_name_or_path=model_path,
-    learning_rate=5e-6,
-    batch_size=2,
-    mini_batch_size=1,
-    num_ppo_epochs=4,          # 注意不是 ppo_epochs，而是 num_ppo_epochs
-    logging_steps=10,
-    save_steps=500,
-    output_dir=output_dir,
-    report_to="none",          # 禁用wandb
-    log_with=None              # 可省略，已由 report_to 控制
+        learning_rate=5e-6,
+        
+        batch_size=2,
+        mini_batch_size=1,
+        ppo_epochs=4,
+        
+        init_kl_coef=1.0,
+        target_kl=0.01,
+        
+        cliprange=0.2,
+        cliprange_value=0.2,
     )
     model = AutoModelForCausalLMWithValueHead.from_pretrained(model_path)
     ref_model = create_reference_model(model)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
-    ppo_trainer = PPOTrainer(config, model, ref_model, tokenizer)
-
+    ppo_trainer = PPOTrainer(
+        config=config,
+        model=model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+    )
     gen_kwargs = {
-        "max_new_tokens": 32,
+        "max_new_tokens": 100,
         "do_sample": True,
         "temperature": 0.7,
         "top_k": 0,
@@ -69,13 +76,15 @@ def run_ppo(model_path, dataset_path, output_dir):
     for epoch in range(NUM_EPOCHS):
         idxs = np.random.permutation(len(train_dataset))
         for start in range(0, len(train_dataset), config.batch_size):
-            batch = train_dataset.select(range(start, min(start+config.batch_size, len(train_dataset))))
+            batch = train_dataset.select(range(start, min(start + config.batch_size, len(train_dataset))))
             prompts = [ex["prompt"] for ex in batch]
             refs = [ex["long_answer"] for ex in batch]
 
             enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
             input_ids = enc.input_ids.to(ppo_trainer.accelerator.device)
-            prompt_tensors = [input_ids[i, :enc.attention_mask[i].sum()] for i in range(len(input_ids))]
+            attention_mask = enc.attention_mask
+
+            prompt_tensors = [input_ids[i, :attention_mask[i].sum().item()] for i in range(len(input_ids))]
 
             outputs = ppo_trainer.generate(prompt_tensors, **gen_kwargs)
 
@@ -84,9 +93,13 @@ def run_ppo(model_path, dataset_path, output_dir):
             for i, out_ids in enumerate(outputs):
                 prompt_len = prompt_tensors[i].size(0)
                 gen_ids = out_ids[prompt_len:]
-                response_tensors.append(gen_ids)
+                response_tensors.append(gen_ids.to(ppo_trainer.accelerator.device))
                 txt = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
                 generated.append(txt)
+
+                print(f"[PROMPT] {prompts[i]}")
+                print(f"[GENERATION] {txt}")
+                print(f"[REFERENCE] {refs[i]}")
 
             raw_rewards = get_rewards(generated, refs)
             rewards = [torch.tensor(r).to(ppo_trainer.accelerator.device) for r in raw_rewards]
@@ -96,7 +109,7 @@ def run_ppo(model_path, dataset_path, output_dir):
 
         print(f"Epoch {epoch+1}/{NUM_EPOCHS} done")
 
-    ppo_trainer.save_pretrained(output_dir)
+    ppo_trainer.model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
 
 if __name__ == "__main__":
